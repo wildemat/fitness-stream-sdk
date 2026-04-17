@@ -90,16 +90,35 @@ engine.stopStreaming()
 ## Architecture
 
 ```
-┌──────────────────────────────────────────┐
-│         FitnessStreamEngine              │
-│                                          │
-│  MetricRegistry ← SchemaResolver        │
-│  MetricCollector (dynamic HK queries)   │
-│  LocationCollector (CoreLocation)       │
-│  CustomMetricStore (app-pushed values)  │
-│  ComputedMetricEngine (pace, HR zone)   │
-│  HTTPPostTransport (JSON POST)          │
-└──────────────────────────────────────────┘
+Host App                        SDK                              Endpoint
+─────────                       ───                              ────────
+                         ┌─────────────────────┐
+register(metrics:) ────> │   MetricRegistry    │
+registerCustom()   ────> │  (HK + custom)      │
+                         └────────┬────────────┘
+                                  │
+configure(endpoint:)              ▼
+  │                      ┌─────────────────────┐       GET /schema
+  └────────────────────> │   SchemaResolver    │ ◄──────────────────  Endpoint
+                         │  registry ∩ wanted  │ ──────────────────> POST /schema/ack
+                         └────────┬────────────┘
+                                  │ resolved schema
+                                  ▼
+startStreaming() ──────> ┌─────────────────────┐
+                         │ FitnessStreamEngine │
+                         │                     │
+                         │  MetricCollector ◄──── HealthKit (anchored queries)
+                         │  LocationCollector ◄── CoreLocation
+                         │  ComputedEngine ◄───── pace, HR zone (derived)
+setCustomValue() ──────> │  CustomMetricStore  │
+                         │         │           │
+                         │         ▼           │
+tick() ────────────────> │  MetricSnapshot     │
+                         │  (values dict)      │
+                         │         │           │
+                         │         ▼           │
+                         │  HTTPPostTransport ─────── POST /metrics ──> Endpoint
+                         └─────────────────────┘
 ```
 
 ## Available Metrics
