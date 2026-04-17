@@ -1,0 +1,14 @@
+{
+  "name": "fitness-stream-schema",
+  "version": "0.1.0",
+  "description": "Schema generator and validator for FitnessStream SDK endpoints",
+  "bin": {
+    "fitness-stream-schema": "./schema-tool.js"
+  },
+  "main": "schema-tool.js",
+  "files": ["schema-tool.js", "catalog.json"],
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}
