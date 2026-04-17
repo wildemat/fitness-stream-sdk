@@ -43,6 +43,48 @@ public enum SchemaResolver {
         )
     }
 
+    /// Merge a resolved schema into the user's existing toggle list.
+    ///
+    /// Rules:
+    /// - Identifiers in `resolved` but not in `currentToggles` → added with `true`
+    /// - Identifiers in `currentToggles` that came from a previous remote schema
+    ///   but are no longer in `resolved` or `defaultIdentifiers` → removed
+    /// - Existing toggle values are **never** changed
+    ///
+    /// Returns the updated toggles and whether anything changed.
+    public static func mergeIntoToggles(
+        resolvedSchema: ResolvedSchema,
+        currentToggles: [String: Bool],
+        defaultIdentifiers: Set<String>,
+        previousRemoteIdentifiers: Set<String>
+    ) -> (toggles: [String: Bool], newRemoteIds: Set<String>, didChange: Bool) {
+        var toggles = currentToggles
+        var didChange = false
+
+        let resolvedIds = resolvedSchema.resolvedIdentifiers
+
+        // Add new identifiers from the resolved schema (default on)
+        for id in resolvedIds {
+            if toggles[id] == nil {
+                toggles[id] = true
+                didChange = true
+            }
+        }
+
+        // Remove identifiers that were previously added by a remote schema
+        // but are no longer in the resolved schema or the app defaults
+        for id in previousRemoteIdentifiers {
+            if !resolvedIds.contains(id) && !defaultIdentifiers.contains(id) {
+                if toggles.removeValue(forKey: id) != nil {
+                    didChange = true
+                }
+            }
+        }
+
+        let newRemoteIds = resolvedIds.subtracting(defaultIdentifiers)
+        return (toggles, newRemoteIds, didChange)
+    }
+
     /// Create a "stream all" fallback schema from the full registry.
     public static func resolveAll(registry: MetricRegistry) -> ResolvedSchema {
         let resolved = registry.allDescriptors.map { descriptor -> ResolvedMetric in

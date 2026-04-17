@@ -116,4 +116,42 @@ public enum MetricCatalog {
 
     /// Set of all catalog identifiers, for collision checks.
     public static let allIdentifiers: Set<String> = Set(all.map(\.identifier))
+
+    /// Default friendly display names for all catalog metrics.
+    /// Host apps can override these via `StreamConfiguration.friendlyNameOverrides`.
+    public static let friendlyNames: [String: String] = [
+        "heart_rate": "Heart Rate",
+        "heart_rate_zone": "HR Zone",
+        "active_energy_kcal": "Active Energy",
+        "distance_meters": "Distance",
+        "distance_cycling_meters": "Cycling Distance",
+        "step_count": "Steps",
+        "cadence": "Cadence",
+        "cycling_power": "Cycling Power",
+        "cycling_speed": "Cycling Speed",
+        "running_power": "Running Power",
+        "running_speed": "Running Speed",
+        "running_stride_length": "Stride Length",
+        "running_vertical_oscillation": "Vertical Oscillation",
+        "running_ground_contact_time": "Ground Contact Time",
+        "swimming_stroke_count": "Stroke Count",
+        "distance_swimming": "Swim Distance",
+        "vo2_max": "VO2 Max",
+        "respiratory_rate": "Respiratory Rate",
+        "pace_min_per_km": "Pace",
+        "latitude": "Latitude",
+        "longitude": "Longitude",
+        "elevation_meters": "Elevation",
+    ]
+
+    /// Returns the source group name for a metric identifier.
+    public static func sourceGroup(for identifier: String) -> String {
+        guard let descriptor = descriptor(for: identifier) else { return "Custom" }
+        switch descriptor.source {
+        case .healthKit: return "Health"
+        case .computed:  return "Computed"
+        case .location:  return "Location"
+        case .custom:    return "Custom"
+        }
+    }
 }

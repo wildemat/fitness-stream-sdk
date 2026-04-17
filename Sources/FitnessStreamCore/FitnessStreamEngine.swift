@@ -4,7 +4,7 @@ import os.log
 
 /// Main entry point for the FitnessStream SDK.
 /// Coordinates metric collection, schema negotiation, and streaming transport.
-public final class FitnessStreamEngine {
+public final class FitnessStreamEngine: ObservableObject {
 
     private static let log = Logger(subsystem: "FitnessStreamSDK", category: "Engine")
 
@@ -12,9 +12,10 @@ public final class FitnessStreamEngine {
 
     public let healthStore: HKHealthStore
     public let registry = MetricRegistry()
+    public let configuration: StreamConfiguration
     public weak var delegate: FitnessStreamDelegate?
 
-    public private(set) var state: StreamState = .idle {
+    @Published public private(set) var state: StreamState = .idle {
         didSet {
             delegate?.engine(self, didChangeState: state)
         }
@@ -39,8 +40,9 @@ public final class FitnessStreamEngine {
 
     // MARK: - Init
 
-    public init(healthStore: HKHealthStore) {
+    public init(healthStore: HKHealthStore, configuration: StreamConfiguration? = nil) {
         self.healthStore = healthStore
+        self.configuration = configuration ?? StreamConfiguration()
         self.collector = MetricCollector(healthStore: healthStore)
         self.customStore = CustomMetricStore(registry: registry)
     }
@@ -50,6 +52,7 @@ public final class FitnessStreamEngine {
     /// Register catalog metrics by their SDK identifiers.
     public func register(metrics identifiers: [String]) {
         registry.register(identifiers: identifiers)
+        configuration.initializeIfEmpty(identifiers: identifiers)
     }
 
     /// Register a custom metric.
@@ -74,7 +77,163 @@ public final class FitnessStreamEngine {
         customStore.clearValue(for: identifier)
     }
 
-    // MARK: - Configuration
+    // MARK: - Endpoint management
+
+    /// Save an endpoint URL and API key. Resets metric toggles to the default
+    /// app-registered schema.
+    public func saveEndpoint(url: String, apiKey: String?) {
+        configuration.savedEndpointURL = url
+        configuration.savedAPIKey = apiKey
+        configuration.resetToDefaults(identifiers: registry.allDescriptors.map(\.identifier))
+
+        if let parsed = URL(string: url) {
+            self.endpoint = StreamEndpoint(
+                url: parsed,
+                apiKey: apiKey,
+                frequency: configuration.frequency
+            )
+            let schema = SchemaResolver.resolveAll(registry: registry)
+            self.resolvedSchema = schema
+            state = .ready
+        }
+    }
+
+    /// Rebuild the active endpoint from current configuration.
+    public func refreshEndpoint() {
+        guard let urlString = configuration.savedEndpointURL,
+              let url = URL(string: urlString) else {
+            self.endpoint = nil
+            return
+        }
+        self.endpoint = StreamEndpoint(
+            url: url,
+            apiKey: configuration.savedAPIKey,
+            frequency: configuration.frequency
+        )
+        let schema = SchemaResolver.resolveAll(registry: registry)
+        self.resolvedSchema = schema
+        state = .ready
+    }
+
+    // MARK: - Verify connection + auto schema fetch
+
+    /// Two-step verification: health check then auto schema fetch.
+    ///
+    /// 1. POST ping to the endpoint URL
+    /// 2. If succeeds, GET `{url}/schema`
+    /// 3. Merge resolved schema into toggle list (additive only)
+    public func verifyConnection(completion: @escaping (VerifyResult) -> Void) {
+        guard let urlString = configuration.savedEndpointURL,
+              let url = URL(string: urlString) else {
+            completion(.connectionFailed(
+                VerifyError.noEndpoint
+            ))
+            return
+        }
+
+        let apiKey = configuration.savedAPIKey
+
+        // Step 1: Health check (POST ping)
+        healthCheck(url: url, apiKey: apiKey) { [weak self] pingResult in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                switch pingResult {
+                case .failure(let error):
+                    completion(.connectionFailed(error))
+
+                case .success(let statusCode):
+                    if !(200...299).contains(statusCode) {
+                        completion(.connectionFailed(
+                            VerifyError.httpStatus(statusCode)
+                        ))
+                        return
+                    }
+
+                    // Step 2: Auto schema fetch (GET {url}/schema)
+                    self.fetchAndMergeSchema(
+                        baseURL: url,
+                        apiKey: apiKey,
+                        completion: completion
+                    )
+                }
+            }
+        }
+    }
+
+    private func healthCheck(
+        url: URL,
+        apiKey: String?,
+        completion: @escaping (Result<Int, Error>) -> Void
+    ) {
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let apiKey, !apiKey.isEmpty {
+            request.setValue(apiKey, forHTTPHeaderField: "X-API-Key")
+        }
+        request.httpBody = Data("{\"ping\":true}".utf8)
+        request.timeoutInterval = 5
+
+        URLSession.shared.dataTask(with: request) { _, response, error in
+            if let error {
+                completion(.failure(error))
+                return
+            }
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            completion(.success(status))
+        }.resume()
+    }
+
+    private func fetchAndMergeSchema(
+        baseURL: URL,
+        apiKey: String?,
+        completion: @escaping (VerifyResult) -> Void
+    ) {
+        let schemaURL: URL
+        if #available(iOS 16.0, *) {
+            schemaURL = baseURL.appending(path: "schema")
+        } else {
+            schemaURL = baseURL.appendingPathComponent("schema")
+        }
+
+        schemaFetcher.fetch(from: schemaURL, apiKey: apiKey) { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self else { return }
+
+                switch result {
+                case .failure:
+                    completion(.connectedNoSchema)
+
+                case .success(let definition):
+                    let resolved = SchemaResolver.resolve(
+                        schema: definition,
+                        registry: self.registry
+                    )
+                    self.resolvedSchema = resolved
+
+                    let defaultIds = Set(self.registry.allDescriptors.map(\.identifier))
+
+                    let (newToggles, newRemoteIds, didChange) = SchemaResolver.mergeIntoToggles(
+                        resolvedSchema: resolved,
+                        currentToggles: self.configuration.metricToggles,
+                        defaultIdentifiers: defaultIds,
+                        previousRemoteIdentifiers: self.configuration.remoteSchemaIdentifiers
+                    )
+
+                    self.configuration.metricToggles = newToggles
+                    self.configuration.remoteSchemaIdentifiers = newRemoteIds
+
+                    if didChange {
+                        completion(.connectedSchemaApplied)
+                    } else {
+                        completion(.connectedSchemaUnchanged)
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: - Configuration (legacy compat)
 
     /// Configure a streaming endpoint. Triggers schema negotiation if schemaURL is set.
     public func configure(
@@ -117,24 +276,16 @@ public final class FitnessStreamEngine {
                     completion(.resolved(resolved))
 
                 case .failure(let error):
-                    if case SchemaFetchError.notFound = error {
-                        let schema = SchemaResolver.resolveAll(registry: self.registry)
-                        self.resolvedSchema = schema
-                        self.state = .ready
-                        completion(.fallback("Schema endpoint returned 404"))
-                    } else {
-                        let schema = SchemaResolver.resolveAll(registry: self.registry)
-                        self.resolvedSchema = schema
-                        self.state = .ready
-                        completion(.fallback(error.localizedDescription))
-                    }
+                    let schema = SchemaResolver.resolveAll(registry: self.registry)
+                    self.resolvedSchema = schema
+                    self.state = .ready
+                    completion(.fallback(error.localizedDescription))
                 }
             }
         }
     }
 
     /// Configure an endpoint directly without schema negotiation.
-    /// Streams all registered metrics.
     public func configureSimple(endpoint: StreamEndpoint) {
         self.endpoint = endpoint
         let schema = SchemaResolver.resolveAll(registry: registry)
@@ -164,7 +315,7 @@ public final class FitnessStreamEngine {
         state = .streaming
     }
 
-    /// Pause streaming (stops the transport timer but keeps collecting).
+    /// Pause streaming.
     public func pauseStreaming() {
         streamTimer?.invalidate()
         streamTimer = nil
@@ -191,10 +342,11 @@ public final class FitnessStreamEngine {
         state = .idle
     }
 
-    // MARK: - Tick (called externally by the host app's timer)
+    // MARK: - Tick
 
     /// Build a snapshot from all sources and optionally stream it.
-    /// The host app calls this on its own 1-second timer.
+    /// Values are filtered through `configuration.enabledIdentifiers` — only
+    /// metrics the user has toggled on are included in the payload.
     public func tick(elapsedSeconds: TimeInterval) -> MetricSnapshot {
         guard let schema = resolvedSchema else {
             return MetricSnapshot(
@@ -206,31 +358,30 @@ public final class FitnessStreamEngine {
         }
 
         let resolvedIds = schema.resolvedIdentifiers
+        let enabledIds = configuration.enabledIdentifiers
+        let activeIds = resolvedIds.intersection(enabledIds)
+
         var values: [String: MetricValue] = [:]
 
-        // HK values
         let hkValues = collector.currentValues()
-        for (key, value) in hkValues where resolvedIds.contains(key) {
+        for (key, value) in hkValues where activeIds.contains(key) {
             values[key] = value
         }
 
-        // Location values
         let locationValues = locationCollector.currentValues()
-        for (key, value) in locationValues where resolvedIds.contains(key) {
+        for (key, value) in locationValues where activeIds.contains(key) {
             values[key] = value
         }
 
-        // Computed values
         let computed = computedEngine.compute(
             rawValues: values,
             elapsedSeconds: elapsedSeconds,
-            resolvedIdentifiers: resolvedIds
+            resolvedIdentifiers: activeIds
         )
         values.merge(computed) { _, new in new }
 
-        // Custom values
         let customValues = customStore.currentValues()
-        for (key, value) in customValues where resolvedIds.contains(key) {
+        for (key, value) in customValues where activeIds.contains(key) {
             values[key] = value
         }
 
@@ -243,8 +394,9 @@ public final class FitnessStreamEngine {
 
         delegate?.engine(self, didCollect: snapshot)
 
-        // Stream if enough time has passed
-        if state == .streaming, let endpoint {
+        if state == .streaming,
+           configuration.streamEnabled,
+           let endpoint {
             let now = Date()
             if now.timeIntervalSince(lastStreamTime) >= endpoint.frequency {
                 sendSnapshot(snapshot)
@@ -257,7 +409,6 @@ public final class FitnessStreamEngine {
 
     // MARK: - Transport
 
-    /// Set a custom transport (for testing or alternate protocols).
     public func setTransport(_ transport: StreamTransport) {
         self.transport = transport
     }
@@ -302,7 +453,28 @@ public final class FitnessStreamEngine {
     }
 }
 
-// MARK: - Configuration result
+// MARK: - Verify result
+
+public enum VerifyResult {
+    case connectionFailed(Error)
+    case connectedNoSchema
+    case connectedSchemaApplied
+    case connectedSchemaUnchanged
+}
+
+public enum VerifyError: Error, LocalizedError {
+    case noEndpoint
+    case httpStatus(Int)
+
+    public var errorDescription: String? {
+        switch self {
+        case .noEndpoint: return "No endpoint URL saved"
+        case .httpStatus(let code): return "HTTP \(code)"
+        }
+    }
+}
+
+// MARK: - Configuration result (legacy compat)
 
 public enum ConfigureResult {
     case resolved(ResolvedSchema)
