@@ -46,6 +46,13 @@ targets: [
 ]
 ```
 
+### Products
+
+| Product | What it includes | When to use |
+|---------|-----------------|-------------|
+| `FitnessStreamCore` | Engine, metric collection, schema negotiation, transport | Always required |
+| `FitnessStreamUI` | `StreamConfigView` (SwiftUI settings panel) | Optional. Use if you want the drop-in config UI. Skip if you build your own settings screen. |
+
 ### Quick Start
 
 ```swift
@@ -90,20 +97,172 @@ engine.setCustomValue(.string("Squats"), for: "current_exercise")
 engine.stopStreaming()
 ```
 
+### HealthKit Authorization
+
+The SDK does not request HealthKit authorization itself — your app must do this. The engine provides helpers to get the exact types needed based on what you registered:
+
+```swift
+let readTypes = engine.requiredHealthKitReadTypes   // Set<HKObjectType>
+let shareTypes = engine.requiredHealthKitShareTypes  // Set<HKSampleType>
+
+healthStore.requestAuthorization(toShare: shareTypes, read: readTypes) { success, error in
+    // proceed with workout
+}
+```
+
+You must also add the HealthKit entitlement and usage descriptions to your `Info.plist`:
+
+```
+NSHealthShareUsageDescription — why you read health data
+NSHealthUpdateUsageDescription — why you write workout sessions
+```
+
+### Workout Lifecycle
+
+The SDK does **not** own the `HKWorkoutSession`. Your app creates and manages the session. The SDK attaches its metric collectors when you call `startStreaming()` and detaches them on `stopStreaming()`.
+
+```swift
+// Your app starts the HK session
+let session = try HKWorkoutSession(healthStore: store, configuration: config)
+session.startActivity(with: Date())
+
+// Then tell the SDK to start collecting and streaming
+engine.startStreaming(workoutType: "Running", startDate: Date())
+
+// On your 1-second timer, call tick() — the engine collects from HK,
+// builds a snapshot, and streams it at the configured frequency
+let snapshot = engine.tick(elapsedSeconds: elapsed)
+
+// Pause/resume streaming with the workout
+engine.pauseStreaming()
+engine.resumeStreaming()
+
+// Stop when the workout ends
+engine.stopStreaming()
+```
+
+The `tick()` method returns a `MetricSnapshot` on every call. You can read its values to update your own UI — you don't have to query HealthKit separately for display purposes.
+
+### Custom Metrics
+
+Custom metrics let you attach any app-specific data to the streamed payload. The SDK doesn't collect these — your app pushes values, and the SDK includes them in snapshots alongside HealthKit data.
+
+**Register at startup** (before streaming begins):
+
+```swift
+engine.registerCustom(identifier: "current_exercise", valueType: .string)
+engine.registerCustom(identifier: "reps", valueType: .int)
+engine.registerCustom(identifier: "weight_lb", valueType: .double)
+engine.registerCustom(identifier: "is_rest_period", valueType: .bool)
+
+// Nested objects are also supported
+engine.registerCustom(identifier: "segment_info", valueType: .object)
+```
+
+**Push values anytime during a workout:**
+
+```swift
+engine.setCustomValue(.string("Bench Press"), for: "current_exercise")
+engine.setCustomValue(.int(12), for: "reps")
+engine.setCustomValue(.double(135.0), for: "weight_lb")
+engine.setCustomValue(.bool(false), for: "is_rest_period")
+
+// Nested object
+engine.setCustomValue(.object([
+    "exercise_name": .string("Bench Press"),
+    "reps": .int(12),
+    "load_lb": .double(135.0),
+]), for: "segment_info")
+
+// Clear when no longer relevant
+engine.clearCustomValue(for: "current_exercise")
+```
+
+Rules:
+- Custom identifiers cannot collide with catalog identifiers (e.g., you can't register `"heart_rate"` as custom)
+- Pushing a value for an unregistered identifier is a no-op with a warning log
+- Custom values persist across pause/resume. Call `clearCustomValue` explicitly when needed.
+
+### Friendly Name Overrides
+
+The SDK provides default display names for all catalog metrics (e.g., `"heart_rate"` shows as "Heart Rate" in the config UI). You can override these for your app:
+
+```swift
+engine.configuration.friendlyNameOverrides["active_energy_kcal"] = "Calories"
+engine.configuration.friendlyNameOverrides["distance_meters"] = "Run Distance"
+engine.configuration.friendlyNameOverrides["current_exercise"] = "Exercise"
+```
+
+Overrides apply to the `StreamConfigView` toggle list. If no override is set, the SDK uses its built-in friendly names. If there's no built-in name either (custom metrics), it falls back to title-casing the identifier.
+
 ### StreamConfigView (Drop-in Settings UI)
 
-`FitnessStreamUI` provides a ready-made SwiftUI configuration panel:
+`FitnessStreamUI` provides a complete SwiftUI settings panel that handles endpoint management, connection verification, schema negotiation, and per-metric toggle selection:
 
 ```swift
 import FitnessStreamUI
 
-// Present it however you want
+// Present as a sheet
 .sheet(isPresented: $showSettings) {
     StreamConfigView(engine: engine)
 }
+
+// Or as a navigation destination
+NavigationLink("Stream Settings") {
+    StreamConfigView(engine: engine)
+}
+
+// Or wrapped in UIHostingController for UIKit apps
+let hostingVC = UIHostingController(rootView: StreamConfigView(engine: engine))
+present(hostingVC, animated: true)
 ```
 
-The config view handles endpoint management, connection verification, schema negotiation, and per-metric toggle selection. All state is persisted automatically.
+**What the config view provides:**
+
+| Section | Controls |
+|---------|----------|
+| Streaming | Enable/disable toggle |
+| Connection | Endpoint URL, API key, write frequency slider, **Save Endpoint** button |
+| Verification | **Verify Connection** button with status messages |
+| Data Points | Per-metric toggles with friendly names, grouped by source |
+
+**How it works:**
+
+1. User enters an endpoint URL and taps **Save Endpoint**. The metric list appears showing the app's default registered metrics, all toggled on.
+2. User taps **Verify Connection**. The SDK pings the endpoint, then auto-fetches `GET {endpoint}/schema`.
+3. If the endpoint serves a schema, new metrics are added to the list (toggled on by default). Metrics the endpoint doesn't request are removed. **Existing toggle choices are never overridden.**
+4. If the endpoint has no schema, the message "No custom data requested" appears and the default list stays.
+5. The user toggles individual metrics on/off. Only toggled-on metrics are included in the streamed payload.
+6. All state (endpoint, toggles, frequency) is persisted to `UserDefaults` automatically.
+7. Changing the endpoint URL and saving it resets the toggle list to defaults until the next verification.
+
+**If you're not using StreamConfigView**, you can still read/write all state through `engine.configuration`:
+
+```swift
+let config = engine.configuration
+
+config.savedEndpointURL = "https://example.com/metrics"
+config.savedAPIKey = "sk-..."
+config.frequency = 5.0
+config.streamEnabled = true
+
+// Read the user's toggle selections
+let enabledMetrics = config.enabledIdentifiers  // Set<String>
+
+// Check what's toggled
+let hrEnabled = config.metricToggles["heart_rate"] ?? false
+```
+
+### StreamConfiguration Persistence
+
+`StreamConfiguration` persists all state to `UserDefaults`. By default it uses the standard suite with the key prefix `com.fitnessstream.sdk`. If you need a custom suite (e.g., for app groups or multiple SDK instances):
+
+```swift
+let config = StreamConfiguration(suiteName: "group.com.myapp", keyPrefix: "myapp.stream")
+let engine = FitnessStreamEngine(healthStore: store, configuration: config)
+```
+
+Persisted state includes: endpoint URL, API key, frequency, stream enabled toggle, all metric toggle values, and remote schema identifiers.
 
 ---
 
